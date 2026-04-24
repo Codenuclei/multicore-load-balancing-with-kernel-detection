@@ -31,4 +31,10 @@ void kernel_enum_processors(LOGICAL_PROCESSOR_RELATIONSHIP relation_type,
                           PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX* buffer, 
                           DWORD* ReturnLength);
 
+static inline DWORD get_physical_cores(void) {
+    SYSTEM_INFO si;
+    GetNativeSystemInfo(&si);
+    return si.dwNumberOfProcessors / 2;
+}
+
 #endif
