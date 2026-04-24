@@ -5,6 +5,7 @@
 - v1.1: Performance optimizations added
 - v1.2: Enhanced kernel detection with CPU usage monitoring
 - v1.3: Add work stealing algorithm support
+- v1.4: Add NUMA support for multi-socket systems
 
 A Windows console application that dynamically distributes computational tasks across multiple CPU cores using intelligent load balancing algorithms.
 
