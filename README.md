@@ -3,6 +3,7 @@
 ## Version History
 - v1.0: Initial release with basic load balancing
 - v1.1: Performance optimizations added
+- v1.2: Enhanced kernel detection with CPU usage monitoring
 
 A Windows console application that dynamically distributes computational tasks across multiple CPU cores using intelligent load balancing algorithms.
 
