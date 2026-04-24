@@ -1,4 +1,7 @@
-# Multicore Load Balancing Scheduler with Kernel Detection
+# Multicore Load Balancing Scheduler with Kernel Detection v1.0
+
+## Version History
+- v1.0: Initial release with basic load balancing
 
 A Windows console application that dynamically distributes computational tasks across multiple CPU cores using intelligent load balancing algorithms.
 
