@@ -2,10 +2,10 @@
 
 CC = gcc
 CFLAGS = -O2 -Wall -D_CRT_SECURE_NO_WARNINGS -Iinclude
-LDFLAGS = -lkernel32 -ladvapi32
+LDFLAGS = -lkernel32 -ladvapi32 -lws2_32
 
 TARGET = scheduler.exe
-SOURCES = main.c src/kernel_detect.c src/scheduler.c src/ui.c
+SOURCES = main.c src/kernel_detect.c src/scheduler.c src/ui.c src/gui.c
 OBJECTS = $(SOURCES:.c=.o)
 
 all: $(TARGET)
