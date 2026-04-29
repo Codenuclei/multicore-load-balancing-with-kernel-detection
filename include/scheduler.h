@@ -28,10 +28,13 @@ typedef struct CORE_QUEUE {
     DWORD core_id;
     TASK* head;
     TASK* tail;
-    DWORD count;
-    DWORD active_count;
+    volatile DWORD count;
+    volatile DWORD active_count;
+    double usage;
     CRITICAL_SECTION cs;
+    CONDITION_VARIABLE cv;
     HANDLE thread_pool;
+    struct SCHEDULER* sched;
 } CORE_QUEUE;
 
 typedef struct SCHEDULER {
@@ -46,6 +49,7 @@ typedef struct SCHEDULER {
     BOOL running;
     HANDLE monitor_thread;
     CRITICAL_SECTION global_cs;
+    SYSTEM_INFO_EXT* sys_info;
 } SCHEDULER;
 
 SCHEDULER* scheduler_init(DWORD num_cores);
@@ -58,6 +62,7 @@ void scheduler_set_algorithm(SCHEDULER* sched, SCHED_ALGORITHM algo);
 SCHED_ALGORITHM scheduler_get_algorithm(SCHEDULER* sched);
 DWORD scheduler_get_best_core(SCHEDULER* sched);
 void scheduler_run_task(SCHEDULER* sched, TASK* task);
+TASK* scheduler_steal_task(SCHEDULER* sched, DWORD thief_core_id);
 void scheduler_start(SCHEDULER* sched);
 void scheduler_stop(SCHEDULER* sched);
 void scheduler_get_stats(SCHEDULER* sched, DWORD* total, DWORD* completed, DWORD* failed);
