@@ -5,6 +5,7 @@
 
 typedef struct {
     DWORD core_id;
+    DWORD physical_core_id;
     DWORD processor_group;
     DWORD64 mask;
     double cpu_usage;
@@ -19,6 +20,12 @@ typedef struct {
     DWORD num_logical_cores;
     DWORDLONG total_memory;
     char cpu_brand[128];
+    char gpu_brand[128];
+    char os_version[64];
+    char os_build[16];
+    char motherboard[128];
+    char storage_info[128];
+    BOOL is_win11;
 } SYSTEM_INFO_EXT;
 
 SYSTEM_INFO_EXT* kernel_init(void);
