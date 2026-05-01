@@ -14,17 +14,29 @@ static DWORD WINAPI core_worker_thread(LPVOID param) {
     
     while (1) {
         EnterCriticalSection(&queue->cs);
+        while (queue->count == 0 && queue->sched->running) {
+            LeaveCriticalSection(&queue->cs);
+            task = scheduler_steal_task(queue->sched, queue->core_id);
+            EnterCriticalSection(&queue->cs);
+            if (task) {
+                LeaveCriticalSection(&queue->cs);
+                goto execute;
+            }
+            SleepConditionVariableCS(&queue->cv, &queue->cs, 100); // Wait for task or timeout
+            if (!queue->sched->running) {
+                LeaveCriticalSection(&queue->cs);
+                return 0;
+            }
+        }
         
         if (queue->count == 0) {
             LeaveCriticalSection(&queue->cs);
-            Sleep(10);
             continue;
         }
         
         task = queue->head;
         if (!task) {
             LeaveCriticalSection(&queue->cs);
-            Sleep(10);
             continue;
         }
         
@@ -32,26 +44,26 @@ static DWORD WINAPI core_worker_thread(LPVOID param) {
         if (queue->head == NULL) {
             queue->tail = NULL;
         }
-        queue->count--;
-        queue->active_count++;
-        
+        InterlockedDecrement((LONG*)&queue->count);
         LeaveCriticalSection(&queue->cs);
         
-        if (task->work_func) {
-            DWORD start = GetTickCount();
-            task->status = 1;
-            task->start_time = start;
-            
-            task->work_func(task->arg);
-            
-            task->end_time = GetTickCount();
-            task->actual_time = task->end_time - start;
-            task->status = 2;
+    execute:
+        if (task) {
+            InterlockedIncrement((LONG*)&queue->active_count);
+            if (task->work_func) {
+                DWORD start = GetTickCount();
+                task->status = 1;
+                task->start_time = start;
+                
+                task->work_func(task->arg);
+                
+                task->end_time = GetTickCount();
+                task->actual_time = task->end_time - start;
+                task->status = 2;
+            }
+            InterlockedDecrement((LONG*)&queue->active_count);
+            InterlockedIncrement((LONG*)&queue->sched->completed_tasks);
         }
-        
-        EnterCriticalSection(&queue->cs);
-        queue->active_count--;
-        LeaveCriticalSection(&queue->cs);
     }
     
     return 0;
@@ -59,21 +71,75 @@ static DWORD WINAPI core_worker_thread(LPVOID param) {
 
 static DWORD WINAPI rebalance_thread(LPVOID param) {
     SCHEDULER* sched = (SCHEDULER*)param;
+    const DWORD OVERLOAD_LIMIT = 5; // Simple threshold: >5 tasks in queue
     
     while (sched->running) {
-        Sleep(1000);
+        Sleep(100); // Check every 100ms for faster rebalancing
         
         if (!sched->running) break;
         
-        EnterCriticalSection(&sched->global_cs);
-        
+        // Update smoothed usage metrics
         for (DWORD i = 0; i < sched->num_cores; i++) {
-            EnterCriticalSection(&sched->queues[i].cs);
-            DWORD load = sched->queues[i].count + sched->queues[i].active_count;
-            LeaveCriticalSection(&sched->queues[i].cs);
+            double target = (sched->queues[i].active_count > 0 || sched->queues[i].count > 0) ? 100.0 : 0.0;
+            sched->queues[i].usage = sched->queues[i].usage * 0.7 + target * 0.3;
         }
         
-        LeaveCriticalSection(&sched->global_cs);
+        DWORD busiest_core = (DWORD)-1;
+        DWORD idlest_core = (DWORD)-1;
+        DWORD max_load = 0;
+        DWORD min_load = (DWORD)-1;
+        
+        // Phase 1: Identify Imbalance
+        for (DWORD i = 0; i < sched->num_cores; i++) {
+            // Use lock-free read for heuristic
+            DWORD load = sched->queues[i].count;
+            
+            if (load > max_load) {
+                max_load = load;
+                busiest_core = i;
+            }
+            if (load < min_load) {
+                min_load = load;
+                idlest_core = i;
+            }
+        }
+        
+        // Phase 2: Push Migration
+        // If the busiest core is overloaded and the idlest is significantly lighter
+        if (busiest_core != (DWORD)-1 && idlest_core != (DWORD)-1 && 
+            max_load > OVERLOAD_LIMIT && (max_load - min_load) > 2) {
+            
+            if (TryEnterCriticalSection(&sched->queues[busiest_core].cs)) {
+                if (TryEnterCriticalSection(&sched->queues[idlest_core].cs)) {
+                    // Migrate one task from busiest to idlest
+                    if (sched->queues[busiest_core].count > 0) {
+                        TASK* task = sched->queues[busiest_core].head;
+                        if (task) {
+                            sched->queues[busiest_core].head = task->next;
+                            if (sched->queues[busiest_core].head == NULL) {
+                                sched->queues[busiest_core].tail = NULL;
+                            }
+                            InterlockedDecrement((LONG*)&sched->queues[busiest_core].count);
+                            
+                            // Add to idlest
+                            task->next = NULL;
+                            if (sched->queues[idlest_core].tail) {
+                                sched->queues[idlest_core].tail->next = task;
+                                sched->queues[idlest_core].tail = task;
+                            } else {
+                                sched->queues[idlest_core].head = task;
+                                sched->queues[idlest_core].tail = task;
+                            }
+                            InterlockedIncrement((LONG*)&sched->queues[idlest_core].count);
+                            task->core_assigned = idlest_core;
+                            WakeConditionVariable(&sched->queues[idlest_core].cv);
+                        }
+                    }
+                    LeaveCriticalSection(&sched->queues[idlest_core].cs);
+                }
+                LeaveCriticalSection(&sched->queues[busiest_core].cs);
+            }
+        }
     }
     
     return 0;
@@ -106,9 +172,16 @@ SCHEDULER* scheduler_init(DWORD num_cores) {
         sched->queues[i].tail = NULL;
         sched->queues[i].count = 0;
         sched->queues[i].active_count = 0;
+        sched->queues[i].usage = 0.0;
+        sched->queues[i].sched = sched;
         InitializeCriticalSection(&sched->queues[i].cs);
+        InitializeConditionVariable(&sched->queues[i].cv);
         sched->queues[i].thread_pool = CreateThread(NULL, 0, core_worker_thread, 
                                                &sched->queues[i], 0, NULL);
+        
+        // Kernel Awareness: Pin the thread to its specific logical core
+        DWORD_PTR mask = (DWORD_PTR)1 << i;
+        SetThreadAffinityMask(sched->queues[i].thread_pool, mask);
     }
     
     return sched;
@@ -154,9 +227,7 @@ TASK* scheduler_create_task(void* (*work_func)(void*), void* arg, DWORD priority
     TASK* task = (TASK*)calloc(1, sizeof(TASK));
     if (!task) return NULL;
     
-    EnterCriticalSection(&g_task_counter_cs);
-    task->task_id = ++g_task_counter;
-    LeaveCriticalSection(&g_task_counter_cs);
+    task->task_id = InterlockedIncrement((LONG*)&g_task_counter);
     
     task->work_func = work_func;
     task->arg = arg;
@@ -178,9 +249,11 @@ BOOL scheduler_submit_task(SCHEDULER* sched, TASK* task) {
     DWORD core_id;
     
     switch (sched->algorithm) {
-        case SCHED_ROUND_ROBIN:
-            core_id = (sched->total_tasks + 1) % sched->num_cores;
+        case SCHED_ROUND_ROBIN: {
+            static volatile LONG rr_counter = 0;
+            core_id = InterlockedIncrement(&rr_counter) % sched->num_cores;
             break;
+        }
             
         case SCHED_LEAST_LOADED:
             core_id = scheduler_get_best_core(sched);
@@ -206,13 +279,12 @@ BOOL scheduler_submit_task(SCHEDULER* sched, TASK* task) {
         sched->queues[core_id].head = task;
         sched->queues[core_id].tail = task;
     }
-    sched->queues[core_id].count++;
+    InterlockedIncrement((LONG*)&sched->queues[core_id].count);
     
+    WakeConditionVariable(&sched->queues[core_id].cv);
     LeaveCriticalSection(&sched->queues[core_id].cs);
     
-    EnterCriticalSection(&sched->global_cs);
-    sched->total_tasks++;
-    LeaveCriticalSection(&sched->global_cs);
+    InterlockedIncrement((LONG*)&sched->total_tasks);
     
     return TRUE;
 }
@@ -259,9 +331,8 @@ DWORD scheduler_get_best_core(SCHEDULER* sched) {
     DWORD min_load = (DWORD)-1;
     
     for (DWORD i = 0; i < sched->num_cores; i++) {
-        EnterCriticalSection(&sched->queues[i].cs);
+        // Use a lock-free heuristic first
         DWORD load = sched->queues[i].count + sched->queues[i].active_count;
-        LeaveCriticalSection(&sched->queues[i].cs);
         
         if (load < min_load) {
             min_load = load;
@@ -270,6 +341,75 @@ DWORD scheduler_get_best_core(SCHEDULER* sched) {
     }
     
     return best_core;
+}
+ 
+TASK* scheduler_steal_task(SCHEDULER* sched, DWORD thief_core_id) {
+    if (!sched || !sched->sys_info) return NULL;
+    
+    SYSTEM_INFO_EXT* sys = sched->sys_info;
+    DWORD my_physical = sys->cores[thief_core_id].physical_core_id;
+    DWORD my_group = sys->cores[thief_core_id].processor_group;
+    
+    DWORD victim_core = (DWORD)-1;
+    DWORD max_load = 0;
+    
+    // Tier 1: Logical Siblings (same physical core)
+    for (DWORD i = 0; i < sched->num_cores; i++) {
+        if (i == thief_core_id) continue;
+        if (sys->cores[i].physical_core_id == my_physical) {
+            if (sched->queues[i].count > 0) {
+                victim_core = i;
+                goto perform_steal;
+            }
+        }
+    }
+    
+    // Tier 2: Nearby Cores (same processor group)
+    for (DWORD i = 0; i < sched->num_cores; i++) {
+        if (i == thief_core_id || sys->cores[i].physical_core_id == my_physical) continue;
+        if (sys->cores[i].processor_group == my_group) {
+            if (sched->queues[i].count > max_load) {
+                max_load = sched->queues[i].count;
+                victim_core = i;
+            }
+        }
+    }
+    
+    if (victim_core == (DWORD)-1) {
+        // Tier 3: Global Search
+        for (DWORD i = 0; i < sched->num_cores; i++) {
+            if (i == thief_core_id) continue;
+            if (sched->queues[i].count > max_load) {
+                max_load = sched->queues[i].count;
+                victim_core = i;
+            }
+        }
+    }
+    
+perform_steal:
+    if (victim_core != (DWORD)-1) {
+        if (TryEnterCriticalSection(&sched->queues[victim_core].cs)) {
+            if (sched->queues[victim_core].count > 0) {
+                TASK* task = sched->queues[victim_core].head;
+                if (task) {
+                    sched->queues[victim_core].head = task->next;
+                    if (sched->queues[victim_core].head == NULL) {
+                        sched->queues[victim_core].tail = NULL;
+                    }
+                    InterlockedDecrement((LONG*)&sched->queues[victim_core].count);
+                    LeaveCriticalSection(&sched->queues[victim_core].cs);
+                    
+                    task->core_assigned = thief_core_id;
+                    task->next = NULL;
+                    
+                    return task;
+                }
+            }
+            LeaveCriticalSection(&sched->queues[victim_core].cs);
+        }
+    }
+    
+    return NULL;
 }
 
 void scheduler_set_algorithm(SCHEDULER* sched, SCHED_ALGORITHM algo) {
@@ -319,9 +459,7 @@ CORE_QUEUE* scheduler_get_queue(SCHEDULER* sched, DWORD core_id) {
 }
 
 void* default_work_func(void* arg) {
-    if (!arg) return NULL;
-    
-    DWORD iterations = *(DWORD*)arg;
+    DWORD iterations = (DWORD)(DWORD_PTR)arg;
     volatile double result = 0;
     
     for (DWORD i = 0; i < iterations; i++) {
