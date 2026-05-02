@@ -51,53 +51,132 @@ static void detect_cache_info(CORE_INFO* core, PCACHE_DESCRIPTOR Cache) {
 static void detect_processor_info(SYSTEM_INFO_EXT* sys_info) {
     PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX buffer = NULL;
     DWORD length = 0;
-    DWORD i;
     
-    kernel_enum_processors(RelationAll, &buffer, &length);
-    
+    kernel_enum_processors(RelationProcessorCore, &buffer, &length);
     if (!buffer) return;
     
-    DWORD num_cores = 0;
+    DWORD logical_id = 0;
+    DWORD physical_id = 0;
     PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX ptr = buffer;
     DWORD offset = 0;
     
     while (offset < length) {
-        switch (ptr->Relationship) {
-            case RelationProcessorCore:
-                num_cores++;
-                break;
-            case RelationCache:
-                break;
+        if (ptr->Relationship == RelationProcessorCore) {
+            for (WORD i = 0; i < ptr->Processor.GroupCount; i++) {
+                KAFFINITY mask = ptr->Processor.GroupMask[i].Mask;
+                for (int b = 0; b < sizeof(KAFFINITY) * 8; b++) {
+                    if ((mask >> b) & 1) {
+                        if (logical_id < sys_info->num_cores) {
+                            sys_info->cores[logical_id].physical_core_id = physical_id;
+                            sys_info->cores[logical_id].processor_group = ptr->Processor.GroupMask[i].Group;
+                            logical_id++;
+                        }
+                    }
+                }
+            }
+            physical_id++;
         }
-        
-        if (ptr->Size == 0) break;
         offset += ptr->Size;
         ptr = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)((PBYTE)ptr + ptr->Size);
     }
     
-    sys_info->num_cores = num_cores;
-    sys_info->num_logical_cores = num_cores;
-    sys_info->num_physical_cores = num_cores;
+    sys_info->num_logical_cores = logical_id;
+    sys_info->num_physical_cores = physical_id;
     
     if (buffer) free(buffer);
 }
 
+#include <intrin.h>
+
 static void detect_cpu_brand(char* brand, size_t size) {
-    HKEY hKey;
-    DWORD type = REG_SZ;
-    DWORD cbData = (DWORD)size;
+    int cpu_info[4];
+    char brand_string[49] = {0};
     
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, 
-                    "HARDWARE\\DESCRIPTION\\CPU\\0", 
-                    0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        RegQueryValueExA(hKey, "ProcessorNameString", NULL, &type, 
-                        (LPBYTE)brand, &cbData);
+    // Check if extended CPUID functions are supported
+    __cpuid(cpu_info, 0x80000000);
+    unsigned int nExIds = cpu_info[0];
+    
+    if (nExIds >= 0x80000004) {
+        for (int i = 0; i < 3; ++i) {
+            __cpuid(cpu_info, 0x80000002 + i);
+            memcpy(brand_string + (i * 16), cpu_info, 16);
+        }
+        
+        // Trim leading spaces
+        char* start = brand_string;
+        while (*start == ' ') start++;
+        strncpy(brand, start, size - 1);
+        brand[size - 1] = '\0';
+    } else {
+        // Fallback to Registry if CPUID brand string is not supported
+        HKEY hKey;
+        DWORD type = REG_SZ;
+        DWORD cbData = (DWORD)size;
+        
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, 
+                        "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", 
+                        0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+            RegQueryValueExA(hKey, "ProcessorNameString", NULL, &type, 
+                            (LPBYTE)brand, &cbData);
+            RegCloseKey(hKey);
+        }
+    }
+    
+    if (strlen(brand) == 0) {
+        strcpy(brand, "Generic x86-64 Processor");
+    }
+}
+
+static void detect_os_info(SYSTEM_INFO_EXT* sys) {
+    typedef LONG (WINAPI *RtlGetVersionPtr)(PRTL_OSVERSIONINFOW);
+    HMODULE hMod = GetModuleHandleA("ntdll.dll");
+    if (hMod) {
+        RtlGetVersionPtr pRtlGetVersion = (RtlGetVersionPtr)GetProcAddress(hMod, "RtlGetVersion");
+        if (pRtlGetVersion) {
+            RTL_OSVERSIONINFOW osvi = {0};
+            osvi.dwOSVersionInfoSize = sizeof(osvi);
+            if (pRtlGetVersion(&osvi) == 0) {
+                sprintf(sys->os_build, "%lu", osvi.dwBuildNumber);
+                sys->is_win11 = (osvi.dwBuildNumber >= 22000);
+                if (sys->is_win11) strcpy(sys->os_version, "Windows 11");
+                else if (osvi.dwMajorVersion == 10) strcpy(sys->os_version, "Windows 10");
+                else sprintf(sys->os_version, "Windows %lu.%lu", osvi.dwMajorVersion, osvi.dwMinorVersion);
+            }
+        }
+    }
+}
+
+static void detect_gpu_brand(char* brand, size_t size) {
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\WinSAT", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        DWORD type, cbData = (DWORD)size;
+        RegQueryValueExA(hKey, "PrimaryAdapterString", NULL, &type, (LPBYTE)brand, &cbData);
         RegCloseKey(hKey);
     }
     
     if (strlen(brand) == 0) {
-        strcpy(brand, "Unknown CPU");
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}\\0000", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+            DWORD type, cbData = (DWORD)size;
+            RegQueryValueExA(hKey, "DriverDesc", NULL, &type, (LPBYTE)brand, &cbData);
+            RegCloseKey(hKey);
+        }
     }
+    
+    if (strlen(brand) == 0) strcpy(brand, "Generic VGA / Integrated");
+}
+
+static void detect_motherboard(char* mb, size_t size) {
+    HKEY hKey;
+    char man[64] = {0}, prod[64] = {0};
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\BIOS", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        DWORD type, cbData = 64;
+        RegQueryValueExA(hKey, "BaseBoardManufacturer", NULL, &type, (LPBYTE)man, &cbData);
+        cbData = 64;
+        RegQueryValueExA(hKey, "BaseBoardProduct", NULL, &type, (LPBYTE)prod, &cbData);
+        RegCloseKey(hKey);
+    }
+    if (strlen(man) > 0) sprintf(mb, "%.30s %.30s", man, prod);
+    else strcpy(mb, "Unknown System Board");
 }
 
 SYSTEM_INFO_EXT* kernel_init(void) {
@@ -119,6 +198,15 @@ SYSTEM_INFO_EXT* kernel_init(void) {
     }
     
     detect_cpu_brand(sys_info->cpu_brand, sizeof(sys_info->cpu_brand));
+    detect_os_info(sys_info);
+    detect_gpu_brand(sys_info->gpu_brand, sizeof(sys_info->gpu_brand));
+    detect_motherboard(sys_info->motherboard, sizeof(sys_info->motherboard));
+    
+    // Simple storage detection
+    ULARGE_INTEGER free, total, totalFree;
+    if (GetDiskFreeSpaceExA("C:\\", &free, &total, &totalFree)) {
+        sprintf(sys_info->storage_info, "SSD/HDD (C: %llu GB Total)", total.QuadPart / (1024*1024*1024));
+    }
     
     sys_info->cores = (CORE_INFO*)calloc(sys_info->num_cores, sizeof(CORE_INFO));
     if (sys_info->cores) {
