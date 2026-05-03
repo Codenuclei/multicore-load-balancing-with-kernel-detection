@@ -3,15 +3,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
-#include <time.h>
+#include <winsock.h>
 
 #include "kernel_detect.h"
 #include "scheduler.h"
+#include "gui.h"
 #include "ui.h"
 
 #define VERSION "1.0.0"
 #define DEFAULT_TASK_COUNT 100
 #define DEFAULT_ITERATIONS 1000000
+#define HTTP_PORT 8080
 
 typedef struct {
     DWORD start_time;
@@ -21,6 +23,7 @@ typedef struct {
 } BENCHMARK_DATA;
 
 static BENCHMARK_DATA g_benchmark;
+
 static DWORD WINAPI benchmark_submit_thread(LPVOID param);
 static void run_benchmark(CONSOLE_UI* ui, SCHEDULER* sched, DWORD num_tasks, DWORD iterations);
 static void print_usage(const char* prog_name);
@@ -44,6 +47,7 @@ int main(int argc, char* argv[]) {
         kernel_free(sys_info);
         return 1;
     }
+    sched->sys_info = sys_info;
     
     CONSOLE_UI* ui = ui_init();
     if (!ui) {
@@ -54,6 +58,7 @@ int main(int argc, char* argv[]) {
     }
     
     BOOL interactive = TRUE;
+    BOOL gui_mode = FALSE;
     DWORD benchmark_tasks = DEFAULT_TASK_COUNT;
     DWORD benchmark_iterations = DEFAULT_ITERATIONS;
     
@@ -67,6 +72,13 @@ int main(int argc, char* argv[]) {
             scheduler_set_algorithm(sched, (SCHED_ALGORITHM)algo);
         } else if (strcmp(argv[i], "-b") == 0) {
             interactive = FALSE;
+        } else if (strcmp(argv[i], "-g") == 0) {
+            gui_mode = TRUE;
+            interactive = FALSE;
+            printf("Starting GUI server on http://localhost:%d\n", HTTP_PORT);
+            fflush(stdout);
+            scheduler_start(sched);
+            start_gui_server(sched, sys_info);
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             ui_free(ui);
@@ -82,20 +94,27 @@ int main(int argc, char* argv[]) {
         }
     }
     
+    if (gui_mode) {
+        printf("\nGUI started! Open http://localhost:%d in your browser\n", HTTP_PORT);
+        printf("Press Enter to exit...\n");
+        fflush(stdout);
+        getchar();
+        // g_server_running = FALSE; // Removed as it is now managed by gui server thread
+        ui_free(ui);
+        scheduler_free(sched);
+        kernel_free(sys_info);
+        return 0;
+    }
+    
     if (!interactive) {
         printf("\n=== Running Benchmark ===\n");
         printf("Tasks: %lu, Iterations per task: %lu\n", benchmark_tasks, benchmark_iterations);
-        
-        scheduler_start(sched);
         
         run_benchmark(ui, sched, benchmark_tasks, benchmark_iterations);
         
         printf("\n=== Benchmark Complete ===\n");
         printf("Submitted: %lu tasks\n", g_benchmark.tasks_submitted);
         printf("Total time: %lu ms\n", GetTickCount() - g_benchmark.start_time);
-        
-        scheduler_stop(sched);
-        Sleep(500);
         
         ui_free(ui);
         scheduler_free(sched);
@@ -116,7 +135,7 @@ int main(int argc, char* argv[]) {
                 printf("\nSubmitting %d tasks...\n", DEFAULT_TASK_COUNT);
                 DWORD iter = 5000000;
                 for (DWORD i = 0; i < DEFAULT_TASK_COUNT; i++) {
-                    TASK* task = scheduler_create_task(default_work_func, &iter, 1);
+                    TASK* task = scheduler_create_task(default_work_func, (void*)(DWORD_PTR)iter, 1);
                     if (task) {
                         scheduler_submit_task(sched, task);
                     }
@@ -188,6 +207,13 @@ int main(int argc, char* argv[]) {
                 break;
             }
             
+            case 9: {
+                printf("\nStarting GUI server...\n");
+                start_gui_server(sched, sys_info);
+                printf("GUI started at http://localhost:%d\n", HTTP_PORT);
+                break;
+            }
+            
             default:
                 printf("Invalid choice\n");
                 break;
@@ -219,7 +245,7 @@ static DWORD WINAPI benchmark_submit_thread(LPVOID param) {
     DWORD iterations = DEFAULT_ITERATIONS;
     
     while (g_benchmark.running && g_benchmark.tasks_submitted < DEFAULT_TASK_COUNT) {
-        TASK* task = scheduler_create_task(default_work_func, &iterations, 1);
+        TASK* task = scheduler_create_task(default_work_func, (void*)(DWORD_PTR)iterations, 1);
         if (task) {
             scheduler_submit_task(sched, task);
             g_benchmark.tasks_submitted++;
@@ -238,7 +264,7 @@ static void run_benchmark(CONSOLE_UI* ui, SCHEDULER* sched, DWORD num_tasks, DWO
     DWORD start = GetTickCount();
     
     for (DWORD i = 0; i < num_tasks; i++) {
-        TASK* task = scheduler_create_task(default_work_func, &iterations, 1);
+        TASK* task = scheduler_create_task(default_work_func, (void*)(DWORD_PTR)iterations, 1);
         if (task) {
             scheduler_submit_task(sched, task);
             g_benchmark.tasks_submitted++;
@@ -292,10 +318,11 @@ static void print_usage(const char* prog_name) {
     printf("  -i N    Iterations per task (default: %d)\n", DEFAULT_ITERATIONS);
     printf("  -a N    Algorithm (0=RR, 1=LeastLoaded, 2=WorkStealing)\n");
     printf("  -b      Batch mode (run benchmark and exit)\n");
+    printf("  -g      GUI mode (start web server and open browser)\n");
     printf("  -h      Show this help\n");
     printf("\nExamples:\n");
     printf("  %s                      Interactive mode\n", prog_name);
     printf("  %s -b -t 200 -i 5000000  Benchmark with 200 tasks\n", prog_name);
-    printf("  %s -b -a 1              Benchmark with LeastLoaded\n", prog_name);
+    printf("  %s -g                   GUI mode with web interface\n", prog_name);
     printf("\n");
 }
