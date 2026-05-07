@@ -22,7 +22,7 @@
 \usepackage{booktabs}
 \usepackage{array}
 \usepackage{parskip}
-\usepackage{microtype}
+% microtype removed (footnote patch incompatibility)
 \usepackage{enumitem}
 \usepackage{float}
 \usepackage{caption}
@@ -87,6 +87,8 @@
 \lhead{\small Multicore Load Balancing Scheduler}
 \cfoot{\thepage}
 \renewcommand{\headrulewidth}{0.4pt}
+\setlength{\headheight}{13.6pt}
+\addtolength{\topmargin}{-1.6pt}
 
 % ─────────────────────────────────────────────────────────────
 \begin{document}
@@ -191,11 +193,11 @@ Benchmark results demonstrate near-linear throughput scaling from 1 to 12 cores,
 
 \subsection{Background}
 
-Modern computing systems increasingly rely on multicore processors. As of 2024, even consumer-grade processors ship with 8 to 24 logical cores, and server-class CPUs exceed 128 cores per socket. However, most user-space applications fail to utilize this parallelism effectively --- tasks are dispatched to the OS scheduler, which optimizes for fairness and responsiveness rather than raw throughput \cite{silberschatz2018}.
+Modern computing systems increasingly rely on multicore processors. As of 2024, even consumer-grade processors ship with 8 to 24 logical cores, and server-class CPUs exceed 128 cores per socket. However, most user-space applications fail to utilize this parallelism effectively --- tasks are dispatched to the OS scheduler, which optimizes for fairness and responsiveness rather than raw throughput [1].
 
-The default OS scheduler on Windows uses a priority-based, preemptive, multilevel feedback queue. While effective for interactive workloads, it makes no guarantees about cache locality or affinity, leading to frequent thread migration across physical cores. Each such migration incurs L1/L2 cache invalidation overhead and can degrade throughput by 15--40\% in compute-intensive workloads \cite{culler1999}.
+The default OS scheduler on Windows uses a priority-based, preemptive, multilevel feedback queue. While effective for interactive workloads, it makes no guarantees about cache locality or affinity, leading to frequent thread migration across physical cores. Each such migration incurs L1/L2 cache invalidation overhead and can degrade throughput by 15--40\% in compute-intensive workloads [12].
 
-System-level schedulers that are \textit{kernel-aware} --- i.e., that explicitly understand the underlying CPU topology, cache hierarchy, and core affinity --- can achieve significantly higher throughput. Techniques such as \textbf{work stealing} \cite{blumofe1999} and \textbf{push migration} \cite{love2010} have been demonstrated to approach near-linear speedup on embarrassingly parallel workloads.
+System-level schedulers that are \textit{kernel-aware} --- i.e., that explicitly understand the underlying CPU topology, cache hierarchy, and core affinity --- can achieve significantly higher throughput. Techniques such as \textbf{work stealing} [13] and \textbf{push migration} [10] have been demonstrated to approach near-linear speedup on embarrassingly parallel workloads.
 
 This project builds such a scheduler from first principles on Windows using only the Win32 API and C99, with no external libraries, runtime environments, or third-party frameworks. The complete system --- scheduler engine, hardware detection, and monitoring dashboard --- is compiled into a single self-contained binary.
 
@@ -429,7 +431,7 @@ The choice of C99 over C++ was deliberate: it enforces explicit memory managemen
 
 \subsection{Winsock2 and the WebSocket Protocol}
 
-Winsock2 (Windows Sockets API v2) is used to implement a TCP server that accepts HTTP connections and upgrades them to the WebSocket protocol (RFC 6455 \cite{fette2011}). The upgrade involves:
+Winsock2 (Windows Sockets API v2) is used to implement a TCP server that accepts HTTP connections and upgrades them to the WebSocket protocol (RFC 6455 [5]). The upgrade involves:
 \begin{enumerate}
   \item Parsing the HTTP \texttt{GET /ws} request and extracting the \texttt{Sec-WebSocket-Key} header.
   \item Constructing the accept key by concatenating with the GUID \texttt{258EAFA5-E914-47DA-95CA-C5AB0DC85B11}.
