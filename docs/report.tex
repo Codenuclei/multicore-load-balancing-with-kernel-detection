@@ -359,20 +359,43 @@ Fallback terminal display for headless/non-GUI mode, using Win32 console buffer 
 \toprule
 Feature & Description \\
 \midrule
-Hardware Detection & CPU brand (CPUID), core count, cache sizes, GPU, MB, RAM, OS build \\
-Round Robin & Distributes tasks evenly using a rotating counter modulo core count \\
-Least Loaded & Routes each task to the core with the minimum queue depth \\
-Work Stealing & Idle cores proactively pull tasks from the busiest queue \\
-Push Migration & Monitor rebalances every 100ms when any queue exceeds threshold \\
-Thread Affinity & Each worker pinned to its logical core; no OS migration \\
-Real-Time Dashboard & WebSocket at 20Hz; per-core bars, efficiency, manifest, controls \\
-Live Algorithm Switch & Change policy without restarting the engine \\
-Task Injection & REST API: inject 10/100/1000 tasks on demand \\
-Responsive UI & CSS media queries: desktop, tablet (1100px), mobile (768px), small (480px) \\
+Hardware Detection   & CPU brand (CPUID), core count, cache sizes, GPU, MB, RAM, OS build \\
+Round Robin          & Distributes tasks evenly using a rotating counter modulo core count \\
+Least Loaded         & Routes each task to the core with the minimum queue depth \\
+Work Stealing        & Idle cores proactively pull tasks from the busiest queue \\
+Push Migration       & Monitor rebalances every 100ms when any queue exceeds threshold \\
+Thread Affinity      & Each worker pinned to its logical core; no OS migration \\
+Real-Time Dashboard  & WebSocket at 20Hz; per-core bars, efficiency, manifest, controls \\
+Live Algorithm Switch& Change policy without restarting the engine \\
+Task Injection       & REST API: inject 10/100/1000 tasks on demand \\
+Responsive UI        & CSS media queries: desktop, tablet (1100px), mobile (768px), small (480px) \\
 \bottomrule
 \end{tabular}
 \caption{Feature Summary}
 \end{table}
+
+\subsection{Hardware Detection}
+
+The kernel detection subsystem is one of the most technically distinctive features of KRONOS. Rather than relying on OS abstractions, it reads hardware characteristics directly using the x86 \texttt{CPUID} instruction via the \texttt{\_\_cpuid} intrinsic. CPU brand string extraction uses leaves \texttt{0x80000002}, \texttt{0x80000003}, and \texttt{0x80000004}, yielding a 48-character null-terminated string such as \texttt{"12th Gen Intel(R) Core(TM) i7-12700H"}.
+
+Core topology is enumerated using \texttt{GetLogicalProcessorInformation}, which returns a \texttt{SYSTEM\_LOGICAL\_PROCESSOR\_INFORMATION} array. The scheduler parses this to distinguish physical cores from logical (hyperthreading) units and extracts L1/L2/L3 cache sizes from the \texttt{Cache} union member. GPU model and motherboard identifier are read from the Windows Registry under \texttt{HKEY\_LOCAL\_MACHINE\textbackslash{}SYSTEM\textbackslash{}CurrentControlSet\textbackslash{}Enum}. Operating system build number is retrieved via \texttt{RtlGetVersion} to distinguish Windows 10 (build $<$ 22000) from Windows 11.
+
+\subsection{Scheduling Policies}
+
+\textbf{Round Robin} is the simplest policy: a global atomic counter incremented on each task submission, modulo the core count, selects the target queue. This is O(1) per submission with zero contention on the queues themselves, making it optimal for uniform task sizes where fairness is more important than efficiency.
+
+\textbf{Least Loaded} performs an O(N) scan of all queue depths on each submission and routes the task to the shortest queue. This is optimal for a static snapshot of queue state but can be suboptimal under high concurrency, as multiple threads may simultaneously route to the same ``least loaded'' core before any task is dequeued.
+
+\textbf{Work Stealing} is the default and most powerful policy. Worker threads that find their own queue empty immediately scan all other queues and steal the tail task from the longest queue. This is a non-blocking, self-balancing mechanism that requires no centralized coordination beyond per-queue critical sections. The tail-stealing strategy (as opposed to head-stealing) minimizes contention with the producer inserting at the head.
+
+\subsection{Synchronization Design}
+
+Each \texttt{CORE\_QUEUE} maintains its own \texttt{CRITICAL\_SECTION} and \texttt{CONDITION\_VARIABLE}. Worker threads block on \texttt{SleepConditionVariableCS} with a 100ms timeout, allowing them to also check for work-stealing opportunities when woken by timeout rather than signal. This design avoids a global lock and keeps contention strictly per-queue, enabling all cores to operate in parallel with no shared bottleneck except the task-complete counter, which is updated via \texttt{InterlockedIncrement}.
+
+\subsection{Real-Time Observability}
+
+The WebSocket dashboard is not a post-hoc visualization --- it is an integral part of the scheduler's design. The GUI thread reads live \texttt{usage[]} percentages from shared memory (protected by lightweight spinlocks) and encodes them as JSON every 50ms. The browser client applies an exponential moving average (EMA, $\alpha = 0.45$) to smooth jitter without introducing significant lag. The result is a dashboard that feels responsive and accurate simultaneously.
+
 
 % ═════════════════════════════════════════════════════════════
 \section{Technologies Used}
@@ -397,6 +420,31 @@ Git & Version control with conventional commit messages \\
 \end{tabular}
 \caption{Technology Stack}
 \end{table}
+
+\subsection{C99 and the Win32 API}
+
+The entire application is written in C99, chosen for its predictable memory layout, direct hardware access, and zero-overhead abstraction. The Win32 API provides the threading primitives: \texttt{CreateThread} spawns worker and monitor threads; \texttt{InitializeCriticalSection}/\texttt{EnterCriticalSection}/\texttt{LeaveCriticalSection} protect per-queue data; \texttt{InitializeConditionVariable}/\texttt{SleepConditionVariableCS}/\texttt{WakeAllConditionVariable} implement efficient blocking without busy-waiting. \texttt{SetThreadAffinityMask} pins each thread to a specific logical processor, preventing OS-level migration and maximizing cache reuse.
+
+The choice of C99 over C++ was deliberate: it enforces explicit memory management, eliminates hidden allocations from RAII and STL containers, and produces a smaller binary. The final executable is approximately 120 KB with no DLL dependencies beyond \texttt{kernel32.dll}, \texttt{advapi32.dll}, \texttt{ws2\_32.dll}, and \texttt{crypt32.dll} — all of which ship with every Windows installation.
+
+\subsection{Winsock2 and the WebSocket Protocol}
+
+Winsock2 (Windows Sockets API v2) is used to implement a TCP server that accepts HTTP connections and upgrades them to the WebSocket protocol (RFC 6455 \cite{fette2011}). The upgrade involves:
+\begin{enumerate}
+  \item Parsing the HTTP \texttt{GET /ws} request and extracting the \texttt{Sec-WebSocket-Key} header.
+  \item Constructing the accept key by concatenating with the GUID \texttt{258EAFA5-E914-47DA-95CA-C5AB0DC85B11}.
+  \item Computing SHA-1 via \texttt{CryptCreateHash}/\texttt{CryptHashData} from \texttt{crypt32.dll}.
+  \item Base64-encoding the 20-byte digest and returning it in \texttt{Sec-WebSocket-Accept}.
+\end{enumerate}
+Subsequent frames are encoded in the WebSocket binary framing format: a 2-byte header (FIN bit, opcode \texttt{0x81} for text), followed by a 7-bit payload length (extended to 16-bit for payloads 126--65535 bytes), followed by the UTF-8 JSON payload. The implementation handles all frame sizes encountered in practice without relying on any HTTP or WebSocket library.
+
+\subsection{Frontend Stack (HTML5 / CSS3 / Vanilla JS)}
+
+The dashboard is a self-contained Single Page Application embedded as a C string literal in \texttt{gui\_html.c}. This means the server has zero filesystem dependencies at runtime — the entire UI is served from RAM. The CSS uses CSS Custom Properties (\texttt{var(--amber)}, \texttt{var(--surface)}) for a consistent design token system, and three \texttt{@media} breakpoints for responsive layout. JavaScript handles WebSocket lifecycle, DOM updates via \texttt{getElementById}, and exponential moving average smoothing (\texttt{smooth[i] = smooth[i]*0.55 + u*0.45}) to prevent visual jitter at 20Hz update frequency.
+
+\subsection{Build Toolchain}
+
+The project supports three compilers via \texttt{build.bat}: MSVC (\texttt{cl.exe}), MinGW-w64 (\texttt{gcc}), and TDM-GCC. The recommended build uses MinGW-w64 with GCC 13.2 and \texttt{-O2} optimization, producing an ~120 KB standalone \texttt{scheduler.exe}. A \texttt{Makefile} is also provided for GNU Make compatibility. No CMake, vcpkg, or package manager is required.
 
 % ═════════════════════════════════════════════════════════════
 \section{Implementation Details}
@@ -448,6 +496,97 @@ Load efficiency $E$ is defined as:
 E = \left(1 - \frac{\sigma_{\text{load}}}{\mu_{\text{load}} + \epsilon}\right) \times 100\%
 \]
 where $\sigma$ is the standard deviation of per-core usage, $\mu$ is the mean usage, and $\epsilon = 1$ prevents division by zero. A value of 100\% indicates perfectly balanced load.
+
+\subsection{CPUID Brand String Detection}
+
+The following reads the 48-byte CPU brand string directly via x86 CPUID leaves, bypassing the OS:
+
+\begin{lstlisting}[style=cstyle, caption={CPUID Brand String Extraction}]
+void detect_cpu_brand(char* brand, int brand_size) {
+    int info[4];
+    char raw[49] = {0};
+    for (int i = 0; i < 3; i++) {
+        __cpuid(info, 0x80000002 + i);
+        memcpy(raw + i*16,    &info[0], 4);
+        memcpy(raw + i*16+4,  &info[1], 4);
+        memcpy(raw + i*16+8,  &info[2], 4);
+        memcpy(raw + i*16+12, &info[3], 4);
+    }
+    char* start = raw;
+    while (*start == ' ') start++;
+    strncpy(brand, start, brand_size - 1);
+    brand[brand_size - 1] = '\0';
+}
+\end{lstlisting}
+
+\subsection{Push Migration Monitor Thread}
+
+The monitor thread runs every 100ms, finds overloaded cores, and moves half their tasks to idle cores:
+
+\begin{lstlisting}[style=cstyle, caption={Push Migration Monitor}]
+DWORD WINAPI monitor_thread(LPVOID param) {
+    SCHEDULER* sched = (SCHEDULER*)param;
+    while (sched->running) {
+        Sleep(100);
+        for (int i = 0; i < sched->num_cores; i++) {
+            EnterCriticalSection(&sched->queues[i].cs);
+            int count = sched->queues[i].count;
+            LeaveCriticalSection(&sched->queues[i].cs);
+            if (count <= OVERLOAD_LIMIT) continue;
+            for (int j = 0; j < sched->num_cores; j++) {
+                if (j == i) continue;
+                EnterCriticalSection(&sched->queues[j].cs);
+                int idle = (sched->queues[j].count == 0);
+                LeaveCriticalSection(&sched->queues[j].cs);
+                if (idle) {
+                    int to_move = count / 2;
+                    for (int k = 0; k < to_move; k++) {
+                        TASK* t = dequeue_tail(&sched->queues[i]);
+                        if (!t) break;
+                        enqueue_head(&sched->queues[j], t);
+                        WakeConditionVariable(&sched->queues[j].cv);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    return 0;
+}
+\end{lstlisting}
+
+\subsection{WebSocket Telemetry Frame Encoding}
+
+The telemetry encoder builds a JSON payload and wraps it in a RFC 6455 text frame:
+
+\begin{lstlisting}[style=cstyle, caption={WebSocket JSON Telemetry Push}]
+static void gui_push_telemetry(SOCKET client, SCHEDULER* sched) {
+    char json[4096]; int len = 0;
+    SCHEDULER_STATS stats;
+    scheduler_get_stats(sched, &stats);
+    len += sprintf(json+len,
+        "{\"total\":%lu,\"completed\":%lu,"
+        "\"throughput\":%.1f,\"efficiency\":%.1f,\"cores\":[",
+        stats.total_submitted, stats.total_completed,
+        stats.throughput, stats.efficiency);
+    for (int i = 0; i < sched->num_cores; i++) {
+        len += sprintf(json+len,
+            "%s{\"usage\":%d,\"queue\":%d}",
+            i?",":"",
+            sched->queues[i].usage_pct,
+            sched->queues[i].count);
+    }
+    len += sprintf(json+len, "]}");
+    unsigned char hdr[4]; int hdr_len = 2;
+    hdr[0] = 0x81;
+    if (len < 126) { hdr[1] = (unsigned char)len; }
+    else { hdr[1]=126; hdr[2]=(len>>8)&0xFF; hdr[3]=len&0xFF; hdr_len=4; }
+    send(client, (char*)hdr, hdr_len, 0);
+    send(client, json, len, 0);
+}
+\end{lstlisting}
+
+
 
 % ═════════════════════════════════════════════════════════════
 \section{Results and Testing}
