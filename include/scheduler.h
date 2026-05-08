@@ -14,42 +14,45 @@ typedef struct TASK {
     DWORD task_id;
     DWORD priority;
     DWORD estimated_time;
-    DWORD actual_time;
+    ULONGLONG actual_time;
     void* (*work_func)(void*);
     void* arg;
     DWORD status;
     DWORD core_assigned;
-    DWORD start_time;
-    DWORD end_time;
+    ULONGLONG start_time;
+    ULONGLONG end_time;
     struct TASK* next;
 } TASK;
+
+typedef struct SCHEDULER SCHEDULER;
 
 typedef struct CORE_QUEUE {
     DWORD core_id;
     TASK* head;
     TASK* tail;
-    volatile DWORD count;
-    volatile DWORD active_count;
+    volatile LONG count;           // use interlocked APIs
+    volatile LONG active_count;    // use interlocked APIs
     double usage;
     CRITICAL_SECTION cs;
     CONDITION_VARIABLE cv;
-    HANDLE thread_pool;
-    struct SCHEDULER* sched;
+    HANDLE thread_pool;            // worker thread handle
+    SCHEDULER* sched;
 } CORE_QUEUE;
 
 typedef struct SCHEDULER {
     CORE_QUEUE* queues;
     DWORD num_cores;
     SCHED_ALGORITHM algorithm;
-    DWORD total_tasks;
-    DWORD completed_tasks;
-    DWORD failed_tasks;
+    volatile LONG total_tasks;
+    volatile LONG completed_tasks;
+    volatile LONG failed_tasks;
     double avg_wait_time;
     double avg_turnaround;
     BOOL running;
     HANDLE monitor_thread;
     CRITICAL_SECTION global_cs;
     SYSTEM_INFO_EXT* sys_info;
+    HANDLE start_event;            // event to coordinate worker thread start
 } SCHEDULER;
 
 SCHEDULER* scheduler_init(DWORD num_cores);
